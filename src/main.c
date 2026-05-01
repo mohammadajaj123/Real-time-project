@@ -204,6 +204,7 @@ int main(int argc, char *argv[]) {
         g_state->pieces_placed[0]  = 0;
         g_state->pieces_placed[1]  = 0;
         g_state->transit_serial[0] = g_state->transit_serial[1] = -1;
+        g_state->go                = 0;   /* barrier: hold all members until ready */
         g_round_over               = 0;
         g_round_winner             = -1;
 
@@ -254,6 +255,9 @@ int main(int argc, char *argv[]) {
             close(fwd0[i][0]); close(fwd0[i][1]);
             close(fwd1[i][0]); close(fwd1[i][1]);
         }
+
+        /* release both teams at the same time so fork order gives no advantage */
+        g_state->go = 1;
 
         /* wait for SIGUSR1 from whichever sink finishes first */
         while (!g_round_over) pause();

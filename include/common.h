@@ -36,6 +36,10 @@ typedef struct {
     /* serial numbers for current round */
     int raw_serials[MAX_PIECES];    /* as handed to source (unsorted) */
     int sorted_serials[MAX_PIECES]; /* sorted ascending = delivery order for sink */
+
+    /* start barrier: parent sets this to 1 after all members are forked,
+     * so both teams begin at exactly the same time regardless of fork order */
+    volatile int go;
 } SharedState;
 
 /* Configuration loaded from file */

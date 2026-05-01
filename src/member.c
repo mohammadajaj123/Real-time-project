@@ -70,6 +70,9 @@ void run_source(int team, int n_pieces,
 
     int bwd_rd = open_fifo(bwd_rd_path, O_RDONLY);
 
+    /* wait until the parent releases all teams simultaneously */
+    while (!state->go) ;
+
     bool available[MAX_PIECES], rejected[MAX_PIECES];
     for (int i = 0; i < n_pieces; i++) { available[i] = true; rejected[i] = false; }
 
@@ -144,6 +147,9 @@ void run_intermediate(int team, int member_id,
     int bwd_wr_fd = open_fifo(bwd_wr_path, O_WRONLY);
     int bwd_rd_fd = open_fifo(bwd_rd_path, O_RDONLY);
 
+    /* wait until the parent releases all teams simultaneously */
+    while (!state->go) ;
+
     int moves = 0;
 
     for (;;) {
@@ -190,6 +196,9 @@ void run_sink(int team, int n_pieces,
     signal(SIGPIPE, SIG_IGN);
 
     int bwd_wr = open_fifo(bwd_wr_path, O_WRONLY);
+
+    /* wait until the parent releases all teams simultaneously */
+    while (!state->go) ;
 
     int expected = 0; /* index into sorted_serials */
     int moves    = 0;

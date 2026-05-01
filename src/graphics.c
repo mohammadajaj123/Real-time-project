@@ -12,6 +12,7 @@
 
 #ifdef USE_GRAPHICS
 #include <GL/glut.h>
+#include <math.h>
 
 static SharedState *g_st;
 
