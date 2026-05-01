@@ -1,0 +1,19 @@
+# Furniture Competition Configuration
+# ====================================
+# Number of members per team (min 2)
+n_members = 4
+
+# Number of furniture pieces per round
+n_pieces = 20
+
+# Number of round wins needed to win the competition
+n_wins_needed = 3
+
+# Pause time range in milliseconds (increases with fatigue)
+min_pause_ms = 10
+max_pause_ms = 200
+pause_increment_ms = 3
+
+# Optional: provide specific serial numbers (comma-separated, count must match n_pieces)
+# If omitted, serials are assigned randomly each round
+# serials = 5,2,8,1,3,9,4,7,6,10,15,11,20,13,17,12,19,16,14,18

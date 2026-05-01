@@ -1,0 +1,16 @@
+# compiled binary
+furniture
+furniture_term
+
+# build artifacts
+*.o
+*.a
+
+# temporary FIFOs left by the program
+/tmp/rt_bwd_t*
+
+# editor / OS noise
+.vscode/
+*.swp
+*~
+.DS_Store
