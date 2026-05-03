@@ -1,6 +1,5 @@
 # compiled binary
 furniture
-furniture_term
 
 # build artifacts
 *.o

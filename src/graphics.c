@@ -3,16 +3,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
-#include "graphics.h"
-
-/* ================================================================
- * Compile with -DUSE_GRAPHICS to get an OpenGL/GLUT window.
- * Without it, a simple ANSI terminal display is used instead.
- * ================================================================ */
-
-#ifdef USE_GRAPHICS
-#include <GL/glut.h>
 #include <math.h>
+#include <GL/glut.h>
+#include "graphics.h"
 
 static SharedState *g_st;
 
@@ -181,92 +174,3 @@ void graphics_run(SharedState *state) {
     glutTimerFunc(40, timer_cb, 0);
     glutMainLoop();
 }
-
-/* ================================================================
- * Terminal fallback (no OpenGL)
- * ================================================================ */
-#else  /* !USE_GRAPHICS */
-
-#include <time.h>
-
-static void clear_screen(void) {
-    /* ANSI: move cursor to (1,1) and clear screen */
-    printf("\033[H\033[2J");
-}
-
-static void print_bar(int filled, int total, int width, char ch) {
-    int f = (total > 0) ? (filled * width / total) : 0;
-    putchar('[');
-    for (int i = 0; i < width; i++) putchar(i < f ? ch : ' ');
-    putchar(']');
-}
-
-void graphics_run(SharedState *state) {
-    /* hide cursor */
-    printf("\033[?25l");
-    fflush(stdout);
-
-    while (!state->game_over) {
-        clear_screen();
-
-        printf("\033[1;33m");  /* bold yellow */
-        printf("=========================================================\n");
-        printf("         FURNITURE COMPETITION  -  Round %d\n", state->current_round);
-        printf("=========================================================\033[0m\n\n");
-
-        const char *colors[2] = { "\033[1;34m", "\033[1;31m" };  /* blue, red */
-        const char *names[2]  = { "Team 1 (Blue)", "Team 2 (Red)" };
-
-        for (int t = 0; t < 2; t++) {
-            printf("%s%s\033[0m  wins: %d / %d\n",
-                   colors[t], names[t], state->team_wins[t], state->n_wins_needed);
-
-            printf("  Placed: %3d / %3d  ", state->pieces_placed[t], state->n_pieces);
-            print_bar(state->pieces_placed[t], state->n_pieces, 40, '#');
-            printf("\n");
-
-            printf("  Chain : [pile]");
-            int nm = state->n_members;
-            for (int m = 0; m < nm; m++) {
-                int is_here = (state->transit_serial[t] >= 0 &&
-                               state->transit_member[t] == m);
-                if (is_here) {
-                    printf("%s--[M%d*%d]--\033[0m",
-                           colors[t], m, state->transit_serial[t]);
-                } else {
-                    printf("--[M%d]--", m);
-                }
-            }
-            printf("[house]\n");
-
-            if (state->transit_serial[t] >= 0) {
-                printf("  \033[1;33mIn transit: piece #%d  direction: %s\033[0m\n",
-                       state->transit_serial[t],
-                       state->transit_dir[t] > 0 ? "--->" : "<---");
-            } else {
-                printf("  (no piece in transit)\n");
-            }
-            printf("\n");
-        }
-
-        printf("\033[0;37mPress Ctrl+C to abort.\033[0m\n");
-        fflush(stdout);
-
-        struct timespec ts = { 0, 150000000L }; /* 150 ms */
-        nanosleep(&ts, NULL);
-    }
-
-    /* show final result */
-    clear_screen();
-    printf("\n\033[1;32m");
-    printf("  *** Team %d wins the competition! ***\n", state->winner_team + 1);
-    printf("\033[0m\n");
-    printf("  Final score:  Team 1 = %d wins   Team 2 = %d wins\n\n",
-           state->team_wins[0], state->team_wins[1]);
-
-    /* restore cursor */
-    printf("\033[?25h");
-    fflush(stdout);
-}
-
-#endif /* USE_GRAPHICS */
