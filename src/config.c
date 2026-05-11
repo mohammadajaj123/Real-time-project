@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include "config.h"
 
+/* Strip leading and trailing whitespace from s in place; return new start. */
 static char *trim(char *s) {
     while (isspace((unsigned char)*s)) s++;
     char *e = s + strlen(s);
@@ -12,6 +13,7 @@ static char *trim(char *s) {
     return s;
 }
 
+/* Populate cfg with built-in default values. */
 void config_defaults(Config *cfg) {
     cfg->n_members          = 4;
     cfg->n_pieces           = 20;
@@ -22,6 +24,7 @@ void config_defaults(Config *cfg) {
     cfg->n_provided         = 0;
 }
 
+/* Load configuration from a key=value text file, then clamp to sane ranges. */
 int config_load(const char *path, Config *cfg) {
     config_defaults(cfg);
 
@@ -56,14 +59,13 @@ int config_load(const char *path, Config *cfg) {
     }
     fclose(f);
 
-    /* clamp to sane ranges */
     if (cfg->n_members < 2)            cfg->n_members = 2;
     if (cfg->n_members > MAX_MEMBERS)  cfg->n_members = MAX_MEMBERS;
     if (cfg->n_pieces  < 1)            cfg->n_pieces  = 1;
     if (cfg->n_pieces  > MAX_PIECES)   cfg->n_pieces  = MAX_PIECES;
 
     if (cfg->n_provided > 0 && cfg->n_provided < cfg->n_pieces) {
-        fprintf(stderr, "Warning: %d serials provided but %d pieces needed — "
+        fprintf(stderr, "Warning: %d serials provided but %d pieces needed - "
                         "switching to random.\n", cfg->n_provided, cfg->n_pieces);
         cfg->n_provided = 0;
     }
@@ -71,6 +73,7 @@ int config_load(const char *path, Config *cfg) {
     return 0;
 }
 
+/* Print the current configuration to stdout. */
 void config_print(const Config *cfg) {
     printf("Configuration:\n");
     printf("  members/team     : %d\n", cfg->n_members);

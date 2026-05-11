@@ -3,12 +3,7 @@
 
 #include "common.h"
 
-/*
- * Runs the display loop in the calling process.
- * With USE_GRAPHICS defined: uses OpenGL/GLUT.
- * Otherwise: uses ANSI terminal output.
- * This function never returns (runs until killed).
- */
+/* Run the OpenGL/GLUT display loop in the calling process; never returns. */
 void graphics_run(SharedState *state);
 
-#endif /* GRAPHICS_H */
+#endif

@@ -5,73 +5,81 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
 #include "member.h"
 
-/* ------------------------------------------------------------------ helpers */
+typedef void (*sighandler_t)(int);
+sighandler_t sigset(int sig, sighandler_t disp);
 
-static void do_pause(int min_ms, int max_ms, int inc_ms, int moves) {
-    /* base grows with the number of moves made (team members get tired) */
+/* Sleep for a fatigue-scaled duration: base grows linearly with moves,
+ * is capped at max_ms, then a uniformly random jitter is added. */
+static void rest_with_fatigue(int min_ms, int max_ms, int inc_ms, int moves) {
     int base = min_ms + moves * inc_ms;
     if (base > max_ms) base = max_ms;
-    /* random variation in [0, remaining headroom] */
     int headroom = max_ms - base;
-    int extra = (headroom > 0) ? (rand() % (headroom + 1)) : 0;
-    int total = base + extra;
-    usleep((useconds_t)total * 1000);
+    int jitter   = (headroom > 0) ? (rand() % (headroom + 1)) : 0;
+    usleep((useconds_t)(base + jitter) * 1000);
 }
 
-static int write_msg(int fd, const PipeMsg *m) {
+/* Write a full PipeMsg to fd, looping until all bytes are sent. */
+static int send_message(int fd, const PipeMsg *msg) {
     size_t done = 0;
-    const char *p = (const char *)m;
-    while (done < sizeof(*m)) {
-        ssize_t n = write(fd, p + done, sizeof(*m) - done);
+    const char *p = (const char *)msg;
+    while (done < sizeof(*msg)) {
+        ssize_t n = write(fd, p + done, sizeof(*msg) - done);
         if (n <= 0) return -1;
         done += (size_t)n;
     }
     return 0;
 }
 
-static int read_msg(int fd, PipeMsg *m) {
+/* Read a full PipeMsg from fd, looping until all bytes are received. */
+static int receive_message(int fd, PipeMsg *msg) {
     size_t done = 0;
-    char *p = (char *)m;
-    while (done < sizeof(*m)) {
-        ssize_t n = read(fd, p + done, sizeof(*m) - done);
+    char *p = (char *)msg;
+    while (done < sizeof(*msg)) {
+        ssize_t n = read(fd, p + done, sizeof(*msg) - done);
         if (n <= 0) return -1;
         done += (size_t)n;
     }
     return 0;
 }
 
-/* Open a FIFO, retrying on EINTR.
- * O_WRONLY / O_RDONLY both block until the other end is opened.
- * Intermediate members open their write-end first to avoid chain deadlock. */
-static int open_fifo(const char *path, int flags) {
+/* Open a FIFO with the given flags, retrying until the call succeeds. */
+static int open_fifo_blocking(const char *path, int flags) {
     int fd;
     do { fd = open(path, flags); } while (fd < 0);
     return fd;
 }
 
-/* ------------------------------------------------------------------ source */
+/* Two-step semaphore barrier: announce arrival, then wait to be released. */
+static void wait_at_starting_line(int sem_id) {
+    struct sembuf op;
 
-/*
- * Member 0 of each team.
- * Picks pieces randomly, sends them forward, waits for the backward result.
- *
- * Rejected pieces are put aside until a different piece is successfully
- * placed, then the rejected set is cleared and those pieces are retried.
- */
-void run_source(int team, int n_pieces,
+    op.sem_num = SEM_ARRIVE;
+    op.sem_op  = +1;
+    op.sem_flg = 0;
+    semop(sem_id, &op, 1);
+
+    op.sem_num = SEM_DEPART;
+    op.sem_op  = -1;
+    op.sem_flg = 0;
+    semop(sem_id, &op, 1);
+}
+
+/* Picker (member 0): grab pieces from the pile, send forward, await verdict. */
+void run_picker(int team, int n_pieces,
                 int min_ms, int max_ms, int inc_ms,
-                int fwd_wr, const char *bwd_rd_path,
-                SharedState *state)
+                int forward_out, const char *result_in_path,
+                SharedState *shared, int sem_id)
 {
     srand((unsigned)time(NULL) ^ ((unsigned)getpid() << 8));
-    signal(SIGPIPE, SIG_IGN);
+    sigset(SIGPIPE, SIG_IGN);
 
-    int bwd_rd = open_fifo(bwd_rd_path, O_RDONLY);
+    int result_in = open_fifo_blocking(result_in_path, O_RDONLY);
 
-    /* wait until the parent releases all teams simultaneously */
-    while (!state->go) ;
+    wait_at_starting_line(sem_id);
 
     bool available[MAX_PIECES], rejected[MAX_PIECES];
     for (int i = 0; i < n_pieces; i++) { available[i] = true; rejected[i] = false; }
@@ -79,152 +87,127 @@ void run_source(int team, int n_pieces,
     int placed = 0, moves = 0;
 
     while (placed < n_pieces) {
-        /* build list of pickable piece indices */
-        int pick[MAX_PIECES], np = 0;
+        int pickable[MAX_PIECES], n_pickable = 0;
         for (int i = 0; i < n_pieces; i++)
-            if (available[i] && !rejected[i]) pick[np++] = i;
+            if (available[i] && !rejected[i]) pickable[n_pickable++] = i;
 
-        /* safety: if all remaining are rejected, reset set and retry them */
-        if (np == 0) {
+        if (n_pickable == 0) {
             for (int i = 0; i < n_pieces; i++) rejected[i] = false;
             for (int i = 0; i < n_pieces; i++)
-                if (available[i]) pick[np++] = i;
+                if (available[i]) pickable[n_pickable++] = i;
         }
 
-        int idx    = pick[rand() % np];
-        int serial = state->raw_serials[idx];
+        int chosen_idx = pickable[rand() % n_pickable];
+        int serial     = shared->raw_serials[chosen_idx];
 
-        /* update visualization */
-        state->transit_serial[team] = serial;
-        state->transit_member[team] = 0;
-        state->transit_dir[team]    = 1;
+        shared->transit_serial[team] = serial;
+        shared->transit_member[team] = 0;
+        shared->transit_dir[team]    = 1;
 
-        do_pause(min_ms, max_ms, inc_ms, moves++);
+        rest_with_fatigue(min_ms, max_ms, inc_ms, moves++);
 
-        PipeMsg msg = { serial, 0 };
-        if (write_msg(fwd_wr, &msg) < 0) break;
+        PipeMsg outgoing = { serial, 0 };
+        if (send_message(forward_out, &outgoing) < 0) break;
 
-        /* wait for the result to come back through the chain */
-        PipeMsg result;
-        if (read_msg(bwd_rd, &result) < 0) break;
+        PipeMsg verdict;
+        if (receive_message(result_in, &verdict) < 0) break;
 
-        if (result.accepted) {
-            available[idx] = false;
-            memset(rejected, 0, n_pieces * sizeof(bool)); /* clear rejected set */
+        if (verdict.accepted) {
+            available[chosen_idx] = false;
+            memset(rejected, 0, n_pieces * sizeof(bool));
             placed++;
-            state->pieces_placed[team] = placed;
+            shared->pieces_placed[team] = placed;
         } else {
-            rejected[idx] = true;
+            rejected[chosen_idx] = true;
         }
     }
 
-    state->transit_serial[team] = -1;
-    close(bwd_rd);
-    close(fwd_wr);
+    shared->transit_serial[team] = -1;
+    close(result_in);
+    close(forward_out);
 }
 
-/* --------------------------------------------------------------- intermediate */
-
-/*
- * Members 1 .. N-2.
- * Relay pieces forward; relay the result (accepted/rejected) backward.
- * Pause on each leg to simulate physical effort that grows with fatigue.
- *
- * Opens FIFO write-end before read-end to prevent the deadlock that would
- * occur if every intermediate tried to open its read-end first.
- */
-void run_intermediate(int team, int member_id,
-                      int min_ms, int max_ms, int inc_ms,
-                      int fwd_rd, int fwd_wr,
-                      const char *bwd_rd_path,  /* bwd[member_id]   */
-                      const char *bwd_wr_path,  /* bwd[member_id-1] */
-                      SharedState *state)
+/* Carrier (members 1 to N-2): relay pieces forward, then verdicts back, with rest in between. */
+void run_carrier(int team, int position,
+                 int min_ms, int max_ms, int inc_ms,
+                 int forward_in, int forward_out,
+                 const char *result_in_path,
+                 const char *result_out_path,
+                 SharedState *shared, int sem_id)
 {
-    srand((unsigned)time(NULL) ^ ((unsigned)getpid() << 4) ^ (unsigned)member_id);
-    signal(SIGPIPE, SIG_IGN);
+    srand((unsigned)time(NULL) ^ ((unsigned)getpid() << 4) ^ (unsigned)position);
+    sigset(SIGPIPE, SIG_IGN);
 
-    /* write end first to break the potential open() chain deadlock */
-    int bwd_wr_fd = open_fifo(bwd_wr_path, O_WRONLY);
-    int bwd_rd_fd = open_fifo(bwd_rd_path, O_RDONLY);
+    int result_out = open_fifo_blocking(result_out_path, O_WRONLY);
+    int result_in  = open_fifo_blocking(result_in_path,  O_RDONLY);
 
-    /* wait until the parent releases all teams simultaneously */
-    while (!state->go) ;
+    wait_at_starting_line(sem_id);
 
     int moves = 0;
 
     for (;;) {
-        PipeMsg msg;
-        if (read_msg(fwd_rd, &msg) < 0) break;
+        PipeMsg piece;
+        if (receive_message(forward_in, &piece) < 0) break;
 
-        state->transit_member[team] = member_id;
-        state->transit_dir[team]    = 1;
-        do_pause(min_ms, max_ms, inc_ms, moves++);
+        shared->transit_member[team] = position;
+        shared->transit_dir[team]    = 1;
+        rest_with_fatigue(min_ms, max_ms, inc_ms, moves++);
 
-        if (write_msg(fwd_wr, &msg) < 0) break;
+        if (send_message(forward_out, &piece) < 0) break;
 
-        /* wait for result from the next member */
-        PipeMsg result;
-        if (read_msg(bwd_rd_fd, &result) < 0) break;
+        PipeMsg verdict;
+        if (receive_message(result_in, &verdict) < 0) break;
 
-        state->transit_member[team] = member_id;
-        state->transit_dir[team]    = -1;
-        do_pause(min_ms, max_ms, inc_ms, moves++);
+        shared->transit_member[team] = position;
+        shared->transit_dir[team]    = -1;
+        rest_with_fatigue(min_ms, max_ms, inc_ms, moves++);
 
-        if (write_msg(bwd_wr_fd, &result) < 0) break;
+        if (send_message(result_out, &verdict) < 0) break;
     }
 
-    close(fwd_rd);
-    close(fwd_wr);
-    close(bwd_rd_fd);
-    close(bwd_wr_fd);
+    close(forward_in);
+    close(forward_out);
+    close(result_in);
+    close(result_out);
 }
 
-/* -------------------------------------------------------------------- sink */
-
-/*
- * Member N-1 of each team (the "house").
- * Receives pieces and checks whether the serial matches the next expected
- * piece in sorted order.  Accepted pieces stay; rejected ones are sent back.
- * When all pieces are accepted, signals the parent (SIGUSR1).
- */
-void run_sink(int team, int n_pieces,
-              int min_ms, int max_ms, int inc_ms,
-              int fwd_rd, const char *bwd_wr_path,
-              SharedState *state, pid_t parent_pid)
+/* Placer (member N-1): accept pieces in serial order, signal parent on completion. */
+void run_placer(int team, int n_pieces,
+                int min_ms, int max_ms, int inc_ms,
+                int forward_in, const char *result_out_path,
+                SharedState *shared, int sem_id, pid_t parent_pid)
 {
     srand((unsigned)time(NULL) ^ ((unsigned)getpid() << 2));
-    signal(SIGPIPE, SIG_IGN);
+    sigset(SIGPIPE, SIG_IGN);
 
-    int bwd_wr = open_fifo(bwd_wr_path, O_WRONLY);
+    int result_out = open_fifo_blocking(result_out_path, O_WRONLY);
 
-    /* wait until the parent releases all teams simultaneously */
-    while (!state->go) ;
+    wait_at_starting_line(sem_id);
 
-    int expected = 0; /* index into sorted_serials */
-    int moves    = 0;
+    int expected_idx = 0;
+    int moves        = 0;
 
-    while (expected < n_pieces) {
-        PipeMsg msg;
-        if (read_msg(fwd_rd, &msg) < 0) break;
+    while (expected_idx < n_pieces) {
+        PipeMsg piece;
+        if (receive_message(forward_in, &piece) < 0) break;
 
-        state->transit_member[team] = state->n_members - 1;
-        state->transit_dir[team]    = -1;
-        do_pause(min_ms, max_ms, inc_ms, moves++);
+        shared->transit_member[team] = shared->n_members - 1;
+        shared->transit_dir[team]    = -1;
+        rest_with_fatigue(min_ms, max_ms, inc_ms, moves++);
 
-        PipeMsg result = { msg.serial, 0 };
-        if (msg.serial == state->sorted_serials[expected]) {
-            result.accepted = 1;
-            expected++;
+        PipeMsg verdict = { piece.serial, 0 };
+        if (piece.serial == shared->sorted_serials[expected_idx]) {
+            verdict.accepted = 1;
+            expected_idx++;
         }
 
-        if (write_msg(bwd_wr, &result) < 0) break;
+        if (send_message(result_out, &verdict) < 0) break;
     }
 
-    state->transit_serial[team] = -1;
+    shared->transit_serial[team] = -1;
 
-    /* tell the parent coordinator this team has finished the round */
-    kill(parent_pid, SIGUSR1);
+    kill(parent_pid, (team == 0) ? SIGUSR1 : SIGUSR2);
 
-    close(fwd_rd);
-    close(bwd_wr);
+    close(forward_in);
+    close(result_out);
 }

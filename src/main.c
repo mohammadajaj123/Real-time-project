@@ -4,9 +4,11 @@
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
 #include <time.h>
 #include <omp.h>
 
@@ -15,296 +17,310 @@
 #include "member.h"
 #include "graphics.h"
 
-/* ------------------------------------------------------------------ globals */
+typedef void (*sighandler_t)(int);
+sighandler_t sigset(int sig, sighandler_t disp);
 
-static SharedState             *g_state;
-static volatile sig_atomic_t   g_round_over   = 0;
-static volatile sig_atomic_t   g_round_winner = -1;
-static pid_t                   g_sink_pids[2];
+static SharedState              *g_shared;
+static int                       g_shm_id;
+static int                       g_sem_id;
+static volatile sig_atomic_t     g_round_finished = 0;
+static volatile sig_atomic_t     g_winning_team   = -1;
 
-/* ------------------------------------------------------------------ signals */
-
-static void sigusr1_handler(int sig, siginfo_t *info, void *ctx) {
-    (void)sig; (void)ctx;
-    if (!g_round_over) {
-        pid_t from = info->si_pid;
-        if      (from == g_sink_pids[0]) { g_round_winner = 0; g_round_over = 1; }
-        else if (from == g_sink_pids[1]) { g_round_winner = 1; g_round_over = 1; }
-    }
+/* SIGUSR1 handler: record team 1 as the round winner. */
+static void on_team1_finished(int sig) {
+    (void)sig;
+    if (!g_round_finished) { g_winning_team = 0; g_round_finished = 1; }
 }
 
-static void sigterm_handler(int sig) {
+/* SIGUSR2 handler: record team 2 as the round winner. */
+static void on_team2_finished(int sig) {
     (void)sig;
-    /* clean exit for display process when parent is done */
+    if (!g_round_finished) { g_winning_team = 1; g_round_finished = 1; }
+}
+
+/* SIGTERM handler used by the display child to exit cleanly. */
+static void on_terminate(int sig) {
+    (void)sig;
     _exit(0);
 }
 
-/* ------------------------------------------------------------------ utility */
-
-static int cmp_int(const void *a, const void *b) {
+/* qsort comparator for ints in ascending order. */
+static int compare_ints(const void *a, const void *b) {
     return *(const int *)a - *(const int *)b;
 }
 
-/*
- * Generate n_pieces unique serial numbers.
- * OpenMP is used to initialise the candidate pool in parallel.
- */
-static void generate_serials(const Config *cfg, SharedState *state) {
-    int n = cfg->n_pieces;
+/* Build the round's piece list using Floyd's sampling algorithm,
+ * then make a sorted copy that the placer uses as the expected order. */
+static void prepare_round_pieces(const Config *cfg, SharedState *shared) {
+    int n_pieces = cfg->n_pieces;
 
-    if (cfg->n_provided >= n) {
-        memcpy(state->raw_serials, cfg->provided_serials, (size_t)n * sizeof(int));
+    if (cfg->n_provided >= n_pieces) {
+        memcpy(shared->raw_serials, cfg->provided_serials,
+               (size_t)n_pieces * sizeof(int));
     } else {
-        /* build a pool of size n*5 and shuffle, then take the first n */
-        int pool_size = n * 5;
-        int pool[MAX_PIECES * 5];
+        int pool_size = n_pieces * 5;
+        bool taken[MAX_PIECES * 5 + 1];
 
-        /* OpenMP: initialise pool in parallel */
         #pragma omp parallel for schedule(static)
-        for (int i = 0; i < pool_size; i++)
-            pool[i] = i + 1;
+        for (int i = 0; i <= pool_size; i++) taken[i] = false;
 
-        /* Fisher-Yates shuffle (sequential — depends on previous iteration) */
-        for (int i = pool_size - 1; i > 0; i--) {
-            int j = rand() % (i + 1);
-            int tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+        int out = 0;
+        for (int j = pool_size - n_pieces + 1; j <= pool_size; j++) {
+            int t = 1 + rand() % j;
+            if (taken[t]) {
+                shared->raw_serials[out++] = j;
+                taken[j] = true;
+            } else {
+                shared->raw_serials[out++] = t;
+                taken[t] = true;
+            }
         }
-
-        memcpy(state->raw_serials, pool, (size_t)n * sizeof(int));
     }
 
-    memcpy(state->sorted_serials, state->raw_serials, (size_t)n * sizeof(int));
-    qsort(state->sorted_serials, (size_t)n, sizeof(int), cmp_int);
+    memcpy(shared->sorted_serials, shared->raw_serials,
+           (size_t)n_pieces * sizeof(int));
+    qsort(shared->sorted_serials, (size_t)n_pieces, sizeof(int), compare_ints);
 }
 
-/* Create the N-1 named FIFOs for a team's backward channel */
-static void setup_fifos(int team, int nm, char bwd[][64]) {
-    for (int i = 0; i < nm - 1; i++) {
-        snprintf(bwd[i], 64, "/tmp/rt_bwd_t%d_%d_%d", team, i, getpid());
-        unlink(bwd[i]);
-        if (mkfifo(bwd[i], 0666) < 0) {
-            perror("mkfifo");
+/* Create the team_size-1 backward-channel FIFOs for one team. */
+static void create_result_fifos(int team, int team_size, char paths[][64]) {
+    for (int i = 0; i < team_size - 1; i++) {
+        snprintf(paths[i], 64, "/tmp/rt_bwd_t%d_%d_%d", team, i, getpid());
+        unlink(paths[i]);
+        if (mknod(paths[i], S_IFIFO | 0666, 0) < 0) {
+            perror("mknod");
             exit(1);
         }
     }
 }
 
-static void remove_fifos(int team, int nm) {
+/* Remove the backward-channel FIFOs for one team. */
+static void delete_result_fifos(int team, int team_size) {
     char path[64];
-    for (int i = 0; i < nm - 1; i++) {
+    for (int i = 0; i < team_size - 1; i++) {
         snprintf(path, sizeof(path), "/tmp/rt_bwd_t%d_%d_%d", team, i, getpid());
         unlink(path);
     }
 }
 
-/*
- * Called inside each forked child.
- * Closes all pipe FDs the child does not own, then dispatches to the
- * appropriate run_* function based on member position.
- *
- * Forward pipes  fwd[i] : member i writes → member i+1 reads
- * Backward FIFOs bwd[i] : member i reads  ← member i+1 writes
- */
-static void run_member_proc(int team, int mid, int nm, int n_pieces,
-                             int fwd[][2], char bwd[][64],
-                             const Config *cfg, SharedState *state,
-                             pid_t parent_pid)
-{
-    /* FDs this member actually uses */
-    int my_frd = (mid > 0)      ? fwd[mid - 1][0] : -1;
-    int my_fwr = (mid < nm - 1) ? fwd[mid][1]      : -1;
+/* Detach and remove the System V shared memory and semaphore set. */
+static void release_shared_resources(void) {
+    if (g_shared) {
+        shmdt(g_shared);
+        g_shared = NULL;
+    }
+    if (g_shm_id >= 0) shmctl(g_shm_id, IPC_RMID, 0);
+    if (g_sem_id >= 0) semctl(g_sem_id, 0, IPC_RMID, 0);
+    g_shm_id = g_sem_id = -1;
+}
 
-    /* close all other pipe ends to allow correct EOF propagation */
-    for (int i = 0; i < nm - 1; i++) {
-        if (fwd[i][0] != my_frd) close(fwd[i][0]);
-        if (fwd[i][1] != my_fwr) close(fwd[i][1]);
+/* SIGINT handler: release shared resources before exiting. */
+static void on_interrupt(int sig) {
+    (void)sig;
+    release_shared_resources();
+    _exit(1);
+}
+
+/* Inside each forked child: close pipe FDs not owned by this member,
+ * then dispatch to the picker / carrier / placer role. */
+static void dispatch_team_member(int team, int position, int team_size, int n_pieces,
+                                 int forward_pipes[][2], char result_paths[][64],
+                                 const Config *cfg, SharedState *shared, int sem_id,
+                                 pid_t parent_pid)
+{
+    int forward_in  = (position > 0)              ? forward_pipes[position - 1][0] : -1;
+    int forward_out = (position < team_size - 1)  ? forward_pipes[position][1]     : -1;
+
+    for (int i = 0; i < team_size - 1; i++) {
+        if (forward_pipes[i][0] != forward_in)  close(forward_pipes[i][0]);
+        if (forward_pipes[i][1] != forward_out) close(forward_pipes[i][1]);
     }
 
-    if (mid == 0) {
-        /* source: reads bwd[0] FIFO, writes fwd[0] pipe */
-        run_source(team, n_pieces,
+    if (position == 0) {
+        run_picker(team, n_pieces,
                    cfg->min_pause_ms, cfg->max_pause_ms, cfg->pause_increment_ms,
-                   my_fwr, bwd[0], state);
+                   forward_out, result_paths[0], shared, sem_id);
 
-    } else if (mid == nm - 1) {
-        /* sink: reads fwd[nm-2] pipe, writes bwd[nm-2] FIFO */
-        run_sink(team, n_pieces,
-                 cfg->min_pause_ms, cfg->max_pause_ms, cfg->pause_increment_ms,
-                 my_frd, bwd[nm - 2], state, parent_pid);
+    } else if (position == team_size - 1) {
+        run_placer(team, n_pieces,
+                   cfg->min_pause_ms, cfg->max_pause_ms, cfg->pause_increment_ms,
+                   forward_in, result_paths[team_size - 2],
+                   shared, sem_id, parent_pid);
 
     } else {
-        /* intermediate: relay forward then backward */
-        /* bwd_rd = bwd[mid]   (receives from member mid+1) */
-        /* bwd_wr = bwd[mid-1] (sends to member mid-1)      */
-        run_intermediate(team, mid,
-                         cfg->min_pause_ms, cfg->max_pause_ms, cfg->pause_increment_ms,
-                         my_frd, my_fwr,
-                         bwd[mid], bwd[mid - 1], state);
+        run_carrier(team, position,
+                    cfg->min_pause_ms, cfg->max_pause_ms, cfg->pause_increment_ms,
+                    forward_in, forward_out,
+                    result_paths[position], result_paths[position - 1],
+                    shared, sem_id);
     }
 }
 
-/* -------------------------------------------------------------------- main */
-
+/* Program entry: set up IPC, fork the display, run the round loop, announce winner. */
 int main(int argc, char *argv[]) {
     const char *cfg_file = (argc > 1) ? argv[1] : "config.txt";
     Config cfg;
 
     if (config_load(cfg_file, &cfg) < 0)
-        fprintf(stderr, "Config file '%s' not found — using defaults.\n", cfg_file);
+        fprintf(stderr, "Config file '%s' not found - using defaults.\n", cfg_file);
 
     config_print(&cfg);
 
-    /* ---- shared memory (accessible across all forks) ------------------ */
-    g_state = mmap(NULL, sizeof(SharedState),
-                   PROT_READ | PROT_WRITE,
-                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (g_state == MAP_FAILED) { perror("mmap"); exit(1); }
+    g_shm_id = g_sem_id = -1;
+    g_shared = NULL;
 
-    memset(g_state, 0, sizeof(*g_state));
-    g_state->n_members     = cfg.n_members;
-    g_state->n_pieces      = cfg.n_pieces;
-    g_state->n_wins_needed = cfg.n_wins_needed;
-    g_state->winner_team   = -1;
-    g_state->transit_serial[0] = g_state->transit_serial[1] = -1;
+    g_shm_id = shmget(IPC_PRIVATE, sizeof(SharedState), IPC_CREAT | 0666);
+    if (g_shm_id < 0) { perror("shmget"); exit(1); }
 
-    /* ---- signal handlers ----------------------------------------------- */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = sigusr1_handler;
-    sa.sa_flags     = SA_SIGINFO | SA_RESTART;
-    sigaction(SIGUSR1, &sa, NULL);
+    g_shared = (SharedState *)shmat(g_shm_id, NULL, 0);
+    if (g_shared == (void *)-1) { perror("shmat"); exit(1); }
+
+    memset(g_shared, 0, sizeof(*g_shared));
+    g_shared->n_members     = cfg.n_members;
+    g_shared->n_pieces      = cfg.n_pieces;
+    g_shared->n_wins_needed = cfg.n_wins_needed;
+    g_shared->winner_team   = -1;
+    g_shared->transit_serial[0] = g_shared->transit_serial[1] = -1;
+
+    g_sem_id = semget(IPC_PRIVATE, 2, IPC_CREAT | 0666);
+    if (g_sem_id < 0) { perror("semget"); release_shared_resources(); exit(1); }
+
+    sigset(SIGUSR1, on_team1_finished);
+    sigset(SIGUSR2, on_team2_finished);
+    sigset(SIGINT,  on_interrupt);
 
     srand((unsigned)time(NULL));
 
-    /* flush before fork so buffered output isn't duplicated in the child */
     fflush(stdout);
     fflush(stderr);
 
-    /* ---- fork display process ------------------------------------------ */
-    pid_t disp_pid = fork();
-    if (disp_pid < 0) { perror("fork display"); exit(1); }
-    if (disp_pid == 0) {
-        /* discard any parent stdio buffers inherited by the child */
+    pid_t display_pid = fork();
+    if (display_pid < 0) { perror("fork display"); release_shared_resources(); exit(1); }
+    if (display_pid == 0) {
         fclose(stdin);
-        signal(SIGTERM, sigterm_handler);
-        graphics_run(g_state);
+        sigset(SIGTERM, on_terminate);
+        graphics_run(g_shared);
         _exit(0);
     }
 
-    /* ---- round loop ---------------------------------------------------- */
-    int nm = cfg.n_members;
+    int team_size = cfg.n_members;
 
     for (int round = 1; ; round++) {
         printf("\n=== Round %d starting ===\n", round);
         fflush(stdout);
 
-        /* prepare per-round state */
-        generate_serials(&cfg, g_state);
-        g_state->current_round     = round;
-        g_state->pieces_placed[0]  = 0;
-        g_state->pieces_placed[1]  = 0;
-        g_state->transit_serial[0] = g_state->transit_serial[1] = -1;
-        g_state->go                = 0;   /* barrier: hold all members until ready */
-        g_round_over               = 0;
-        g_round_winner             = -1;
+        prepare_round_pieces(&cfg, g_shared);
+        g_shared->current_round     = round;
+        g_shared->pieces_placed[0]  = 0;
+        g_shared->pieces_placed[1]  = 0;
+        g_shared->transit_serial[0] = g_shared->transit_serial[1] = -1;
+        g_round_finished            = 0;
+        g_winning_team              = -1;
 
-        /* create anonymous pipes (forward direction) */
-        int fwd0[MAX_MEMBERS][2], fwd1[MAX_MEMBERS][2];
-        for (int i = 0; i < nm - 1; i++) {
-            if (pipe(fwd0[i]) < 0 || pipe(fwd1[i]) < 0) {
-                perror("pipe"); exit(1);
+        union semun arg;
+        arg.val = 0;
+        semctl(g_sem_id, SEM_ARRIVE, SETVAL, arg);
+        semctl(g_sem_id, SEM_DEPART, SETVAL, arg);
+
+        int forward_team1[MAX_MEMBERS][2], forward_team2[MAX_MEMBERS][2];
+        for (int i = 0; i < team_size - 1; i++) {
+            if (pipe(forward_team1[i]) < 0 || pipe(forward_team2[i]) < 0) {
+                perror("pipe"); release_shared_resources(); exit(1);
             }
         }
 
-        /* create named FIFOs (backward direction) */
-        char bwd0[MAX_MEMBERS][64], bwd1[MAX_MEMBERS][64];
-        setup_fifos(0, nm, bwd0);
-        setup_fifos(1, nm, bwd1);
+        char result_team1[MAX_MEMBERS][64], result_team2[MAX_MEMBERS][64];
+        create_result_fifos(0, team_size, result_team1);
+        create_result_fifos(1, team_size, result_team2);
 
-        /* fork all member processes */
-        pid_t pids[2 * MAX_MEMBERS];
-        int   np = 0;
+        pid_t worker_pids[2 * MAX_MEMBERS];
+        int   n_workers = 0;
         pid_t parent_pid = getpid();
 
-        for (int i = 0; i < nm; i++) {
+        for (int i = 0; i < team_size; i++) {
             pid_t pid = fork();
-            if (pid < 0) { perror("fork team0"); exit(1); }
+            if (pid < 0) { perror("fork team1"); release_shared_resources(); exit(1); }
             if (pid == 0) {
-                run_member_proc(0, i, nm, cfg.n_pieces, fwd0, bwd0,
-                                &cfg, g_state, parent_pid);
+                dispatch_team_member(0, i, team_size, cfg.n_pieces,
+                                     forward_team1, result_team1,
+                                     &cfg, g_shared, g_sem_id, parent_pid);
                 _exit(0);
             }
-            if (i == nm - 1) g_sink_pids[0] = pid;
-            pids[np++] = pid;
+            worker_pids[n_workers++] = pid;
         }
 
-        for (int i = 0; i < nm; i++) {
+        for (int i = 0; i < team_size; i++) {
             pid_t pid = fork();
-            if (pid < 0) { perror("fork team1"); exit(1); }
+            if (pid < 0) { perror("fork team2"); release_shared_resources(); exit(1); }
             if (pid == 0) {
-                run_member_proc(1, i, nm, cfg.n_pieces, fwd1, bwd1,
-                                &cfg, g_state, parent_pid);
+                dispatch_team_member(1, i, team_size, cfg.n_pieces,
+                                     forward_team2, result_team2,
+                                     &cfg, g_shared, g_sem_id, parent_pid);
                 _exit(0);
             }
-            if (i == nm - 1) g_sink_pids[1] = pid;
-            pids[np++] = pid;
+            worker_pids[n_workers++] = pid;
         }
 
-        /* parent closes all pipe FDs — children own them now */
-        for (int i = 0; i < nm - 1; i++) {
-            close(fwd0[i][0]); close(fwd0[i][1]);
-            close(fwd1[i][0]); close(fwd1[i][1]);
+        for (int i = 0; i < team_size - 1; i++) {
+            close(forward_team1[i][0]); close(forward_team1[i][1]);
+            close(forward_team2[i][0]); close(forward_team2[i][1]);
         }
 
-        /* release both teams at the same time so fork order gives no advantage */
-        g_state->go = 1;
+        struct sembuf op;
+        op.sem_num = SEM_ARRIVE;
+        op.sem_op  = -(short)(2 * team_size);
+        op.sem_flg = 0;
+        if (semop(g_sem_id, &op, 1) < 0) {
+            perror("semop arrive"); release_shared_resources(); exit(1);
+        }
 
-        /* wait for SIGUSR1 from whichever sink finishes first */
-        while (!g_round_over) pause();
+        op.sem_num = SEM_DEPART;
+        op.sem_op  = +(short)(2 * team_size);
+        op.sem_flg = 0;
+        if (semop(g_sem_id, &op, 1) < 0) {
+            perror("semop depart"); release_shared_resources(); exit(1);
+        }
 
-        int winner = (int)g_round_winner;
+        while (!g_round_finished) pause();
 
-        /* give the display a brief moment to show the last move */
+        int winner = (int)g_winning_team;
+
         usleep(300000);
 
-        /* terminate all member processes */
-        for (int i = 0; i < np; i++) kill(pids[i], SIGTERM);
-        for (int i = 0; i < np; i++) waitpid(pids[i], NULL, 0);
+        for (int i = 0; i < n_workers; i++) kill(worker_pids[i], SIGTERM);
+        for (int i = 0; i < n_workers; i++) waitpid(worker_pids[i], NULL, 0);
 
-        /* clean up FIFOs */
-        remove_fifos(0, nm);
-        remove_fifos(1, nm);
+        delete_result_fifos(0, team_size);
+        delete_result_fifos(1, team_size);
 
-        /* record result */
-        g_state->team_wins[winner]++;
+        g_shared->team_wins[winner]++;
         printf("Team %d wins round %d!  Score: Team1=%d  Team2=%d\n",
                winner + 1, round,
-               g_state->team_wins[0], g_state->team_wins[1]);
+               g_shared->team_wins[0], g_shared->team_wins[1]);
         fflush(stdout);
 
-        if (g_state->team_wins[0] >= cfg.n_wins_needed ||
-            g_state->team_wins[1] >= cfg.n_wins_needed) {
+        if (g_shared->team_wins[0] >= cfg.n_wins_needed ||
+            g_shared->team_wins[1] >= cfg.n_wins_needed) {
             break;
         }
 
-        sleep(1); /* brief pause so display can show round result */
+        sleep(1);
     }
 
-    /* announce winner */
-    int champ = (g_state->team_wins[0] >= cfg.n_wins_needed) ? 0 : 1;
-    g_state->winner_team = champ;
-    g_state->game_over   = 1;
+    int champion = (g_shared->team_wins[0] >= cfg.n_wins_needed) ? 0 : 1;
+    g_shared->winner_team = champion;
+    g_shared->game_over   = 1;
 
-    printf("\n*** Team %d wins the competition! ***\n", champ + 1);
+    printf("\n*** Team %d wins the competition! ***\n", champion + 1);
     printf("Final score:  Team 1 = %d   Team 2 = %d\n\n",
-           g_state->team_wins[0], g_state->team_wins[1]);
+           g_shared->team_wins[0], g_shared->team_wins[1]);
     fflush(stdout);
 
-    sleep(4); /* let display process show the winner banner */
+    sleep(4);
 
-    kill(disp_pid, SIGTERM);
-    waitpid(disp_pid, NULL, 0);
+    kill(display_pid, SIGTERM);
+    waitpid(display_pid, NULL, 0);
 
-    munmap(g_state, sizeof(*g_state));
+    release_shared_resources();
     return 0;
 }

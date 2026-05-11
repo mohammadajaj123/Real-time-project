@@ -9,8 +9,7 @@
 
 static SharedState *g_st;
 
-/* ---- drawing helpers ------------------------------------------ */
-
+/* Draw an axis-aligned filled rectangle in the given RGB color. */
 static void draw_rect(float x, float y, float w, float h,
                        float r, float g, float b) {
     glColor3f(r, g, b);
@@ -22,6 +21,7 @@ static void draw_rect(float x, float y, float w, float h,
     glEnd();
 }
 
+/* Draw a filled circle as a triangle fan. */
 static void draw_circle(float cx, float cy, float radius,
                          float r, float g, float b) {
     glColor3f(r, g, b);
@@ -34,6 +34,7 @@ static void draw_circle(float cx, float cy, float radius,
     glEnd();
 }
 
+/* Draw a string of bitmap characters at (x, y) in the given color. */
 static void draw_text(float x, float y, const char *str, float r, float g, float b) {
     glColor3f(r, g, b);
     glRasterPos2f(x, y);
@@ -41,8 +42,7 @@ static void draw_text(float x, float y, const char *str, float r, float g, float
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *c);
 }
 
-/* ---- main display callback ------------------------------------ */
-
+/* GLUT display callback: render the title, both team chains, transit pieces, and game-over banner. */
 static void display_cb(void) {
     int W = glutGet(GLUT_WINDOW_WIDTH);
     int H = glutGet(GLUT_WINDOW_HEIGHT);
@@ -61,43 +61,36 @@ static void display_cb(void) {
     int nm = s->n_members;
     char buf[128];
 
-    /* ---- title bar -------------------------------------------- */
     snprintf(buf, sizeof(buf), "Furniture Competition  Round: %d   "
              "Team 1 wins: %d   Team 2 wins: %d   (need %d)",
              s->current_round, s->team_wins[0], s->team_wins[1], s->n_wins_needed);
     draw_text(10, H - 20, buf, 1.0f, 1.0f, 0.3f);
 
-    /* ---- two teams -------------------------------------------- */
     float team_colors[2][3] = { {0.2f,0.5f,1.0f}, {1.0f,0.35f,0.2f} };
     float row_y[2] = { (float)H * 0.65f, (float)H * 0.28f };
     float labels_y[2] = { row_y[0] + 55, row_y[1] + 55 };
 
     float margin  = 60.0f;
     float usable  = (float)W - 2 * margin;
-    /* spacing between objects: pile | members | house */
-    int   slots   = nm + 2;            /* pile + nm members + house */
+    int   slots   = nm + 2;
     float step    = usable / (float)(slots - 1);
 
     for (int t = 0; t < 2; t++) {
         float *col = team_colors[t];
         float ry   = row_y[t];
 
-        /* team label */
         snprintf(buf, sizeof(buf), "Team %d  [placed %d / %d]",
                  t + 1, s->pieces_placed[t], s->n_pieces);
         draw_text(margin, labels_y[t], buf, col[0], col[1], col[2]);
 
-        /* furniture pile (source end) */
         int pile_remaining = s->n_pieces - s->pieces_placed[t];
         draw_rect(margin - 18, ry - 22, 36, 44, col[0]*0.5f, col[1]*0.5f, col[2]*0.5f);
         snprintf(buf, sizeof(buf), "%d", pile_remaining);
         draw_text(margin - 6, ry - 5, buf, 1, 1, 1);
 
-        /* member circles */
         for (int m = 0; m < nm; m++) {
             float cx = margin + (float)(m + 1) * step;
 
-            /* connector line */
             if (m < nm - 1) {
                 float nx = margin + (float)(m + 2) * step;
                 glColor3f(0.4f, 0.4f, 0.4f);
@@ -112,7 +105,6 @@ static void display_cb(void) {
             draw_text(cx - 9, ry - 5, buf, 1, 1, 1);
         }
 
-        /* piece in transit */
         if (s->transit_serial[t] >= 0) {
             int mem = s->transit_member[t];
             float px = margin + (float)(mem + 1) * step;
@@ -121,7 +113,6 @@ static void display_cb(void) {
             snprintf(buf, sizeof(buf), "%d", s->transit_serial[t]);
             draw_text(px - 8, ry + 30, buf, 0, 0, 0);
 
-            /* direction arrow */
             float ax = px + (s->transit_dir[t] > 0 ? 14 : -14);
             glColor3f(1, 1, 0);
             glBegin(GL_TRIANGLES);
@@ -137,7 +128,6 @@ static void display_cb(void) {
             glEnd();
         }
 
-        /* house (sink end) */
         float hx = margin + (float)(nm + 1) * step;
         draw_rect(hx - 22, ry - 28, 44, 56, 0.2f, 0.55f, 0.2f);
         snprintf(buf, sizeof(buf), "H%d", t + 1);
@@ -146,7 +136,6 @@ static void display_cb(void) {
         draw_text(hx - 6, ry - 20, buf, 0.9f, 0.9f, 0.3f);
     }
 
-    /* ---- game over banner ------------------------------------- */
     if (s->game_over) {
         snprintf(buf, sizeof(buf), "*** Team %d wins the competition! ***",
                  s->winner_team + 1);
@@ -156,12 +145,14 @@ static void display_cb(void) {
     glutSwapBuffers();
 }
 
+/* GLUT timer callback: request a redraw and re-arm at ~25 fps. */
 static void timer_cb(int val) {
     (void)val;
     glutPostRedisplay();
-    glutTimerFunc(40, timer_cb, 0); /* ~25 fps */
+    glutTimerFunc(40, timer_cb, 0);
 }
 
+/* Initialize GLUT, create the window, and enter the main display loop. */
 void graphics_run(SharedState *state) {
     g_st = state;
     int argc = 0;
